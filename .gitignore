@@ -1,0 +1,28 @@
+# Swift Package Manager & Xcode
+.build/
+.swiftpm/
+*.xcodeproj
+*.xcworkspace
+xcuserdata/
+*.xcuserdata
+DerivedData/
+
+# Packaged App Artifacts
+dist/
+*.app/
+
+# Local Secrets & Runtime State
+.env
+.env.*
+config.env
+config.json
+.cache/
+state.json
+incident.json
+run.lock
+STOP
+*.log
+*.log.*
+
+# macOS
+.DS_Store
