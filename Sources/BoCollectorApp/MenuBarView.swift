@@ -69,6 +69,20 @@ struct MenuBarView: View {
                 }
             }
 
+            if let rf = model.state.rssRefetch, (rf.stillPending > 0 || rf.totalSucceeded > 0) {
+                HStack {
+                    Label("待补抓 RSS 全文: \(rf.stillPending) 篇（上次补齐 \(rf.totalSucceeded) 篇）", systemImage: "doc.text.magnifyingglass")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Button("补抓") {
+                        model.refetchRssNow()
+                    }
+                    .controlSize(.mini)
+                    .disabled(model.isBusy)
+                }
+            }
+
             Divider()
 
             // Quick Sync Actions
@@ -89,6 +103,7 @@ struct MenuBarView: View {
                     Divider()
                     Button("强制忽略暂停重试") { model.syncNow(source: "all", force: true) }
                     Button("仅从 Koofr 回收语音稿") { model.harvestNow(cloudMode: false) }
+                    Button("仅补抓云端 RSS 待处理全文") { model.refetchRssNow() }
                 } label: {
                     Image(systemName: "ellipsis.circle")
                 }

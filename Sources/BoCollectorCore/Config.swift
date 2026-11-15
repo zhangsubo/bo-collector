@@ -57,6 +57,11 @@ public struct CollectorConfig: Codable, Equatable, Sendable {
     public var xMonitorMaxItemsPerUser: Int = 20
     public var xMonitorExtractInfographics: Bool = true
 
+    // 2d. RSS Pending Full-Text Edge Refetch (cloud RSS summary -> Mac residential IP / ego-browser fallback)
+    public var rssRefetchEnabled: Bool = true
+    public var rssRefetchMaxPerRun: Int = 15
+    public var rssRefetchUseBrowserFallback: Bool = true
+
     // 3. ASR (Subtitle-less Douyin Video Transcription)
     public var asrEnabled: Bool = true
     public var asrProvider: AsrProviderMode = .instaboxKoofr
@@ -116,6 +121,9 @@ public struct CollectorConfig: Codable, Equatable, Sendable {
         case xMonitorDefaultMinLength = "x_monitor_default_min_length"
         case xMonitorMaxItemsPerUser = "x_monitor_max_items_per_user"
         case xMonitorExtractInfographics = "x_monitor_extract_infographics"
+        case rssRefetchEnabled = "rss_refetch_enabled"
+        case rssRefetchMaxPerRun = "rss_refetch_max_per_run"
+        case rssRefetchUseBrowserFallback = "rss_refetch_use_browser_fallback"
         case asrEnabled = "asr_enabled"
         case asrProvider = "asr_provider"
         case koofrWebdavURL = "koofr_webdav_url"
@@ -173,6 +181,10 @@ public struct CollectorConfig: Codable, Equatable, Sendable {
         xMonitorDefaultMinLength = max(0, try c.decodeIfPresent(Int.self, forKey: .xMonitorDefaultMinLength) ?? def.xMonitorDefaultMinLength)
         xMonitorMaxItemsPerUser = max(1, try c.decodeIfPresent(Int.self, forKey: .xMonitorMaxItemsPerUser) ?? def.xMonitorMaxItemsPerUser)
         xMonitorExtractInfographics = try c.decodeIfPresent(Bool.self, forKey: .xMonitorExtractInfographics) ?? def.xMonitorExtractInfographics
+
+        rssRefetchEnabled = try c.decodeIfPresent(Bool.self, forKey: .rssRefetchEnabled) ?? def.rssRefetchEnabled
+        rssRefetchMaxPerRun = max(1, min(100, try c.decodeIfPresent(Int.self, forKey: .rssRefetchMaxPerRun) ?? def.rssRefetchMaxPerRun))
+        rssRefetchUseBrowserFallback = try c.decodeIfPresent(Bool.self, forKey: .rssRefetchUseBrowserFallback) ?? def.rssRefetchUseBrowserFallback
 
         asrEnabled = try c.decodeIfPresent(Bool.self, forKey: .asrEnabled) ?? def.asrEnabled
         asrProvider = try c.decodeIfPresent(AsrProviderMode.self, forKey: .asrProvider) ?? def.asrProvider
@@ -258,6 +270,7 @@ public struct CollectorConfig: Codable, Equatable, Sendable {
         syncMaxItemsX = max(1, syncMaxItemsX)
         syncMaxItemsDouyin = max(1, syncMaxItemsDouyin)
         xMonitorMaxItemsPerUser = max(1, xMonitorMaxItemsPerUser)
+        rssRefetchMaxPerRun = max(1, min(100, rssRefetchMaxPerRun))
         maxVideoMB = max(5, maxVideoMB)
         maxDurationMin = max(1, maxDurationMin)
         syncIntervalSeconds = max(60, syncIntervalSeconds)
@@ -344,6 +357,9 @@ public struct CollectorConfig: Codable, Equatable, Sendable {
         if let v = pick("VLM_TIMEOUT"), let n = Int(v) { vlmTimeout = max(15, n) }
         if let v = pick("SYNC_MAX_ITEMS_X"), let n = Int(v) { syncMaxItemsX = max(1, n) }
         if let v = pick("SYNC_MAX_ITEMS_DOUYIN"), let n = Int(v) { syncMaxItemsDouyin = max(1, n) }
+        if let v = pick("RSS_REFETCH_ENABLED") { rssRefetchEnabled = EnvFileParser.asBool(v, default: true) }
+        if let v = pick("RSS_REFETCH_MAX_PER_RUN"), let n = Int(v) { rssRefetchMaxPerRun = max(1, min(100, n)) }
+        if let v = pick("RSS_REFETCH_USE_BROWSER_FALLBACK") { rssRefetchUseBrowserFallback = EnvFileParser.asBool(v, default: true) }
         if let v = pick("EGO_SPACE_NAME") { egoSpaceName = v }
         if let v = pick("ORCA_BIN") { orcaBin = v }
         if let v = pick("ORCA_HEAL_AUTOMATION_ID") { orcaHealAutomationId = v }
