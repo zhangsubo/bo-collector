@@ -5,6 +5,7 @@ public enum SourceNames {
         "x_bookmarks": "X 书签",
         "douyin": "抖音收藏",
         "x_monitor": "X 用户监控",
+        "rss": "RSS 订阅",
     ]
 
     public static func displayName(for platform: String) -> String {
@@ -222,6 +223,48 @@ public struct AsrStateSummary: Codable, Equatable, Sendable {
     }
 }
 
+public struct RssRefetchSummary: Codable, Equatable, Sendable {
+    public var checked: Int = 0
+    public var succeededHTTP: Int = 0
+    public var succeededBrowser: Int = 0
+    public var stillPending: Int = 0
+    public var exhausted: Int = 0
+
+    public var totalSucceeded: Int {
+        succeededHTTP + succeededBrowser
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case checked, exhausted
+        case succeededHTTP = "succeeded_http"
+        case succeededBrowser = "succeeded_browser"
+        case stillPending = "still_pending"
+    }
+
+    public init(
+        checked: Int = 0,
+        succeededHTTP: Int = 0,
+        succeededBrowser: Int = 0,
+        stillPending: Int = 0,
+        exhausted: Int = 0
+    ) {
+        self.checked = checked
+        self.succeededHTTP = succeededHTTP
+        self.succeededBrowser = succeededBrowser
+        self.stillPending = stillPending
+        self.exhausted = exhausted
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        checked = (try? c.decodeIfPresent(Int.self, forKey: .checked)) ?? 0
+        succeededHTTP = (try? c.decodeIfPresent(Int.self, forKey: .succeededHTTP)) ?? 0
+        succeededBrowser = (try? c.decodeIfPresent(Int.self, forKey: .succeededBrowser)) ?? 0
+        stillPending = (try? c.decodeIfPresent(Int.self, forKey: .stillPending)) ?? 0
+        exhausted = (try? c.decodeIfPresent(Int.self, forKey: .exhausted)) ?? 0
+    }
+}
+
 public struct HealerState: Codable, Equatable, Sendable {
     public var authPaused: Bool?
     public var authPlatform: String?
@@ -336,11 +379,13 @@ public struct CollectorState: Codable, Equatable, Sendable {
     public var harvestAt: Double? = nil
     public var browserSpaceId: Int? = nil
     public var asr: AsrStateSummary? = nil
+    public var rssRefetch: RssRefetchSummary? = nil
     public var healer: HealerState? = nil
     public var sources: [String: SourceState] = [:]
 
     enum CodingKeys: String, CodingKey {
         case version, target, status, asr, healer, sources
+        case rssRefetch = "rss_refetch"
         case updatedAt = "updated_at"
         case lastTransientError = "last_transient_error"
         case lastAsrRetriggerAt = "last_asr_retrigger_at"
@@ -361,6 +406,7 @@ public struct CollectorState: Codable, Equatable, Sendable {
         harvestAt = try? c.decodeIfPresent(Double.self, forKey: .harvestAt)
         browserSpaceId = try? c.decodeIfPresent(Int.self, forKey: .browserSpaceId)
         asr = try? c.decodeIfPresent(AsrStateSummary.self, forKey: .asr)
+        rssRefetch = try? c.decodeIfPresent(RssRefetchSummary.self, forKey: .rssRefetch)
         healer = try? c.decodeIfPresent(HealerState.self, forKey: .healer)
         sources = (try? c.decodeIfPresent([String: SourceState].self, forKey: .sources)) ?? [:]
     }

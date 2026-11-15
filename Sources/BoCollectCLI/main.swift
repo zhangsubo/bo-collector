@@ -10,8 +10,10 @@ private func printHelp() {
       bo-collect [--config <path>] [--state-dir <dir>] [--quiet] <command> [options]
 
     命令:
-      sync [--source all|x_bookmarks|douyin|x_monitor] [--limit N] [--force]
-          执行一轮增量采集（回收已完成 ASR + 抓新收藏/监控 + 推云端，传完即退）
+      sync [--source all|x_bookmarks|douyin|x_monitor|rss] [--limit N] [--force]
+          执行一轮增量采集（回收已完成 ASR + 补抓云端待处理 RSS 全文 + 抓新收藏/监控 + 推云端，传完即退）
+      refetch [--limit N]
+          仅拉取云端 bo-distiller 待边缘补抓的 RSS 摘要，通过本机代理 HTTP + ego-lite 补齐全文回推
       backfill [--source all|x_bookmarks|douyin] [--max-items N] [--until-end]
           低频慢速补采历史存量收藏
       stop
@@ -19,7 +21,7 @@ private func printHelp() {
       harvest [--cloud]
           检查 Koofr 网盘回收已完成转写文稿并删除网盘原视频（--cloud 触发云端自助回收）
       status
-          查看当前同步进度、待传队列、ASR、LaunchAgent 与异常自愈状态
+          查看当前同步进度、待传队列、ASR、RSS 边缘补抓、LaunchAgent 与异常自愈状态
       resume [--sync-now]
           人工完成登录/验证码后解除暂停态
       doctor
@@ -36,10 +38,12 @@ private func printHelp() {
     print(text)
 }
 
-private func resolvePlatforms(_ sourceArg: String, config: CollectorConfig) -> [String] {
+private func resolvePlatforms(_ sourceArg: String, config: CollectorConfig) -> [String]? {
     if sourceArg == "all" {
-        let enabled = config.enabledDefaultPlatforms
-        return enabled.isEmpty ? ["x_bookmarks", "douyin"] : enabled
+        if !config.enabledDefaultPlatforms.isEmpty || config.rssRefetchEnabled {
+            return nil
+        }
+        return ["x_bookmarks", "douyin"]
     }
     return [sourceArg]
 }
@@ -245,6 +249,7 @@ private func runCLI() -> Int32 {
         let svc = LaunchAgentManager.status()
         let encoder = JSONEncoder()
         let asrVal = (try? st.asr.map { try JSONValue.parse(data: encoder.encode($0)) }) ?? .null
+        let rssRefetchVal = (try? st.rssRefetch.map { try JSONValue.parse(data: encoder.encode($0)) }) ?? .null
         let healerVal = (try? st.healer.map { try JSONValue.parse(data: encoder.encode($0)) }) ?? .null
         let summary: JSONValue = .object([
             "status": .string(st.status),
@@ -256,6 +261,7 @@ private func runCLI() -> Int32 {
                 "binary": .string(svc.binaryPath),
             ]),
             "asr": asrVal,
+            "rss_refetch": rssRefetchVal,
             "healer": healerVal,
             "sources": .object(srcSummary),
         ])
@@ -301,6 +307,35 @@ private func runCLI() -> Int32 {
             return 0
         } catch {
             fputs("回收 ASR 失败: \(error.localizedDescription)\n", stderr)
+            return 1
+        }
+
+    case "refetch":
+        var limit: Int? = nil
+        var i = 0
+        while i < args.count {
+            if args[i] == "--limit", i + 1 < args.count {
+                limit = Int(args[i + 1])
+                i += 2
+            } else {
+                i += 1
+            }
+        }
+        do {
+            let res = try engine.harvestPendingRefetches(limitOverride: limit)
+            let out: JSONValue = .object([
+                "checked": .int(res.checked),
+                "succeeded_http": .int(res.succeededHTTP),
+                "succeeded_browser": .int(res.succeededBrowser),
+                "still_pending": .int(res.stillPending),
+                "exhausted": .int(res.exhausted),
+            ])
+            if !quiet {
+                print(out.toJSONString())
+            }
+            return 0
+        } catch {
+            fputs("补抓云端 RSS 全文失败: \(error.localizedDescription)\n", stderr)
             return 1
         }
 

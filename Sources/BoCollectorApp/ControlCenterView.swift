@@ -415,6 +415,27 @@ struct ControlCenterView: View {
                 }
             }
 
+            sectionCard("云端 RSS 摘要边缘补抓全文 (本机代理 HTTP + ego-lite 兜底)") {
+                HStack {
+                    let rf = model.state.rssRefetch ?? RssRefetchSummary()
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(
+                            "待补抓队列: \(rf.stillPending) 篇  ·  上次检查: \(rf.checked) 篇  ·  上次补齐: \(rf.totalSucceeded) 篇 (HTTP \(rf.succeededHTTP) / 浏览器 \(rf.succeededBrowser))"
+                            + (rf.exhausted > 0 ? "  ·  放弃: \(rf.exhausted) 篇" : "")
+                        )
+                        .font(.subheadline)
+                        Text("云端 RSS 源直抓失败或遇数据中心风控的摘要文章，由本机住宅/代理网络与独立 ego-lite 工作区自动补齐全文。")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Button("立即补抓待处理全文") {
+                        model.refetchRssNow()
+                    }
+                    .disabled(model.isBusy)
+                }
+            }
+
             sectionCard("历史收藏低速补采（防止风控封号，可随时安全停止）") {
                 HStack(spacing: 14) {
                     Picker("补采目标", selection: $backfillSource) {
@@ -833,6 +854,32 @@ struct ControlCenterView: View {
                         }
                     }
                 }
+            }
+
+            sectionCard(
+                "云端 RSS 待补抓全文协同",
+                subtitle: "RSS 订阅统一在云端 bo-distiller 添加与定时拉取；仅当云端直抓遇到 403、公众号环境验证或纯前端渲染空壳时，才下发待补抓任务由本机补齐全文。"
+            ) {
+                toggleSettingRow(
+                    title: "增量巡检时自动补抓云端待处理 RSS 摘要",
+                    hint: "优先使用本机 URLSession（继承 Surge/Clash 代理），未拿到完整正文时可选回退至独立 ego-lite 工作区",
+                    isOn: $model.config.rssRefetchEnabled
+                )
+                Divider()
+                intSettingRow(
+                    title: "单次巡检最多补抓篇数",
+                    hint: "连续 3 次补抓均未拿到更完整正文则标记为 exhausted，不再无限重试",
+                    value: $model.config.rssRefetchMaxPerRun,
+                    range: 1...50,
+                    step: 5,
+                    unit: "篇"
+                )
+                Divider()
+                toggleSettingRow(
+                    title: "HTTP 直抓不足时允许启用 ego-lite 浏览器 DOM 兜底",
+                    hint: "使用独立 bo-collector-refetch 工作区并在提取后立即关闭标签页；遇到验证码拦截页立即安全放弃",
+                    isOn: $model.config.rssRefetchUseBrowserFallback
+                )
             }
         }
     }

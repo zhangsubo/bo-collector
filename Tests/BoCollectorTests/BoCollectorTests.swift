@@ -84,6 +84,9 @@ final class MockBrowserClient: BrowserCollecting, @unchecked Sendable {
     var monitorResult: BrowserCollectResult = BrowserCollectResult(status: "ok")
     var downloadedFiles: [String: Data] = [:]
     var lastFeedKnownIds: [String] = []
+    var extractResultsByURL: [String: BrowserArticleExtractResult] = [:]
+    var defaultExtractResult: BrowserArticleExtractResult = BrowserArticleExtractResult(status: "unavailable")
+    var extractedURLs: [String] = []
 
     func isAvailable() -> Bool { available }
     func checkVersion() -> (ok: Bool, detail: String) { (available, "mock-ego 1.0") }
@@ -131,6 +134,11 @@ final class MockBrowserClient: BrowserCollecting, @unchecked Sendable {
             }
         }
         return out
+    }
+
+    func extractReadableArticle(url: String, handoff: Bool) -> BrowserArticleExtractResult {
+        extractedURLs.append(url)
+        return extractResultsByURL[url] ?? defaultExtractResult
     }
 }
 
@@ -917,5 +925,211 @@ final class BoCollectorTests: XCTestCase {
         XCTAssertEqual(authResp.header("access-control-allow-origin"), "https://x.com")
         let rawJSON = try authResp.json()
         XCTAssertEqual(rawJSON["saved"]?.intValue, 2)
+    }
+
+    func testArticleRefetchMarkdownExtractionAndInterstitialBoundary() throws {
+        let baseURL = URL(string: "https://blog.example.com/posts/2026/rss-design")!
+        let blogHTML = """
+        <!doctype html>
+        <html>
+        <head><title>Ignored Site Suffix</title><script>if (1 < 2 && 3 > 1) { console.log("ok"); }</script></head>
+        <body>
+          <nav><a href="/home">Home</a></nav>
+          <article>
+            <h1>Designing Three-Tier RSS Full-Text Recovery</h1>
+            <p>Modern feeds often ship truncated summaries. See <a href="/docs/spec">the specification</a> for background details and edge constraints across cloud and residential networks.</p>
+            <img src="/assets/architecture.png" alt="Architecture Diagram" />
+            <img src="https://tracker.example.com/pixel.gif" width="1" height="1" />
+            <pre><code class="language-swift">let ok = true
+        print(ok)</code></pre>
+            <ul>
+              <li>Server-first direct extraction</li>
+              <li>Mac residential proxy and browser fallback</li>
+            </ul>
+            <p>This paragraph ensures the extracted body comfortably exceeds the minimum readable character threshold for full-text upgrades.</p>
+          </article>
+          <footer>Copyright 2026</footer>
+        </body>
+        </html>
+        """
+
+        let extracted = ArticleRefetchEngine.extractMarkdownFromHTML(blogHTML, baseURL: baseURL)
+        XCTAssertNotNil(extracted)
+        XCTAssertEqual(extracted?.title, "Designing Three-Tier RSS Full-Text Recovery")
+        let md = extracted?.markdown ?? ""
+        XCTAssertTrue(md.contains("# Designing Three-Tier RSS Full-Text Recovery"))
+        XCTAssertTrue(md.contains("[the specification](https://blog.example.com/docs/spec)"))
+        XCTAssertTrue(md.contains("![Architecture Diagram](https://blog.example.com/assets/architecture.png)"))
+        XCTAssertFalse(md.contains("pixel.gif"))
+        XCTAssertTrue(md.contains("```swift\nlet ok = true"))
+        XCTAssertTrue(md.contains("- Server-first direct extraction"))
+        XCTAssertFalse(md.contains("Copyright 2026"))
+
+        // WeChat #js_content often carries style="visibility: hidden;" in static HTML and uses data-src on images
+        let wechatHTML = """
+        <html><body>
+          <h1 id="activity-name">微信公众号深度技术长文标题</h1>
+          <div id="js_content" style="visibility: hidden;">
+            <p>这是一篇来自微信公众号 RSS 源的正文内容，用于验证在未执行前端脚本把 visibility 改为 visible 之前，原生解析器依然能够保留 #js_content 容器并正确解析懒加载图片与段落结构。</p>
+            <p><img data-src="https://mmbiz.qpic.cn/mmbiz_png/demo123/640?wx_fmt=png" alt="示意图" /></p>
+            <p>第二段继续补充足够多的正文字符数，确保超过最小可读正文长度阈值并完整输出 Markdown 文本与图片链接。</p>
+          </div>
+        </body></html>
+        """
+        let wxExtracted = ArticleRefetchEngine.extractMarkdownFromHTML(wechatHTML, baseURL: URL(string: "https://mp.weixin.qq.com/s/abc"))
+        XCTAssertNotNil(wxExtracted)
+        XCTAssertEqual(wxExtracted?.title, "微信公众号深度技术长文标题")
+        XCTAssertTrue(wxExtracted?.markdown.contains("https://mmbiz.qpic.cn/mmbiz_png/demo123/640?wx_fmt=png") == true)
+
+        // Anti-bot / CAPTCHA interstitials must be strictly rejected
+        let turnstileHTML = """
+        <html><head><title>Just a moment...</title></head>
+        <body><div class="cf-turnstile"></div><p>Verify you are human to continue.</p></body></html>
+        """
+        XCTAssertNil(ArticleRefetchEngine.extractMarkdownFromHTML(turnstileHTML, baseURL: baseURL))
+
+        let wxBlockHTML = """
+        <html><body><div>当前环境异常，完成验证后即可继续访问。</div></body></html>
+        """
+        XCTAssertNil(ArticleRefetchEngine.extractMarkdownFromHTML(wxBlockHTML, baseURL: URL(string: "https://mp.weixin.qq.com/s/blocked")))
+    }
+
+    func testRssPendingRefetchStageAHttpStageBBrowserFallbackAndExhaustedCap() throws {
+        let cfg = makeTestConfig()
+        let postedPayloads = TestBox<[JSONValue]>([])
+
+        let richArticleHTML = """
+        <html><body><article>
+          <h2>Full Origin Article via Stage A HTTP</h2>
+          <p>This full article body was fetched directly over macOS URLSession through the user's residential network, replacing the short RSS summary cleanly and refreshing pipeline_raw so cloud bo-distiller re-cleans and indexes the full content.</p>
+          <p>Additional technical details covering ETag conditional requests, OPML batch import, and cross-source URL deduplication.</p>
+        </article></body></html>
+        """
+
+        let http = MockHTTPTransport { spec in
+            let urlStr = spec.url.absoluteString
+            if urlStr.contains("/api/ingest/state") {
+                XCTAssertTrue(urlStr.contains("source_type=rss"))
+                let stateResp: JSONValue = .object([
+                    "status": .string("ok"),
+                    "recent_ids": .array([]),
+                    "pending_refetch_articles": .array([
+                        .object([
+                            "id": .string("rss_a1"),
+                            "title": .string("Stage A HTTP Article"),
+                            "content": .string("Short teaser..."),
+                            "url": .string("https://simonwillison.net/2026/Nov/15/full-post/"),
+                            "source": .object(["type": .string("rss"), "name": .string("Simon Willison"), "identifier": .string("https://simonwillison.net/atom/everything/")]),
+                            "fetched_date": .string("2026-11-15T05:00:00Z"),
+                            "metadata": .object([
+                                "refetch_status": .string("pending_edge"),
+                                "refetch_attempts": .int(0),
+                                "fetch_mode": .string("auto"),
+                                "pipeline_raw": .object(["content": .string("Short teaser..."), "title": .string("Stage A HTTP Article")]),
+                            ]),
+                        ]),
+                        .object([
+                            "id": .string("rss_a2"),
+                            "title": .string("Stage B Browser Fallback Article"),
+                            "content": .string("Read more..."),
+                            "url": .string("https://csr-blog.example.org/post/2"),
+                            "source": .object(["type": .string("rss"), "name": .string("CSR Tech Blog"), "identifier": .string("https://csr-blog.example.org/rss.xml")]),
+                            "fetched_date": .string("2026-11-15T05:00:00Z"),
+                            "metadata": .object([
+                                "refetch_status": .string("pending_edge"),
+                                "refetch_attempts": .int(1),
+                                "fetch_mode": .string("auto"),
+                                "pipeline_raw": .object(["content": .string("Read more..."), "title": .string("Stage B Browser Fallback Article")]),
+                            ]),
+                        ]),
+                        .object([
+                            "id": .string("rss_a3"),
+                            "title": .string("Gated Interstitial Article"),
+                            "content": .string("Summary kept safely."),
+                            "url": .string("https://gated.example.net/post/3"),
+                            "source": .object(["type": .string("rss"), "name": .string("Gated Feed"), "identifier": .string("https://gated.example.net/feed.xml")]),
+                            "fetched_date": .string("2026-11-15T05:00:00Z"),
+                            "metadata": .object([
+                                "refetch_status": .string("pending_edge"),
+                                "refetch_attempts": .int(2),
+                                "fetch_mode": .string("auto"),
+                                "pipeline_raw": .object(["content": .string("Summary kept safely."), "title": .string("Gated Interstitial Article")]),
+                            ]),
+                        ]),
+                    ]),
+                ])
+                return HTTPResponseData(statusCode: 200, data: try stateResp.toData())
+            }
+            if urlStr == "https://simonwillison.net/2026/Nov/15/full-post/" {
+                return HTTPResponseData(statusCode: 200, headers: ["Content-Type": "text/html; charset=utf-8"], data: Data(richArticleHTML.utf8))
+            }
+            if urlStr == "https://csr-blog.example.org/post/2" {
+                // Empty CSR shell -> Stage A yields nil, triggers Stage B browser fallback
+                return HTTPResponseData(statusCode: 200, headers: ["Content-Type": "text/html"], data: Data("<html><body><div id='app'></div></body></html>".utf8))
+            }
+            if urlStr == "https://gated.example.net/post/3" {
+                return HTTPResponseData(statusCode: 403, data: Data("Forbidden".utf8))
+            }
+            if spec.method == "POST" && urlStr.contains("/api/ingest/articles") {
+                let body = try JSONValue.parse(data: spec.body ?? Data())
+                postedPayloads.withLock { $0.append(body) }
+                return HTTPResponseData(statusCode: 200, data: Data("{\"status\":\"ok\",\"saved\":1,\"duplicates\":0,\"save_failed\":0}".utf8))
+            }
+            return HTTPResponseData(statusCode: 200)
+        }
+
+        let browser = MockBrowserClient()
+        browser.extractResultsByURL["https://csr-blog.example.org/post/2"] = BrowserArticleExtractResult(
+            status: "ok",
+            title: "Stage B Browser Fallback Article",
+            markdown: "## Rendered via Ego Browser\n\nThis rich client-side rendered article body was extracted cleanly from the isolated bo-collector-refetch TaskSpace and exceeds all length checks.",
+            finalURL: "https://csr-blog.example.org/post/2"
+        )
+        browser.extractResultsByURL["https://gated.example.net/post/3"] = BrowserArticleExtractResult(
+            status: "interstitial_blocked",
+            message: "Origin page gated by verification interstitial"
+        )
+
+        let logger = SafeLogger(logPath: cfg.stateDir.appendingPathComponent("logs/collector.log"), echo: false)
+        let engine = SyncEngine(config: cfg, logger: logger, browser: browser, http: http)
+        defer { engine.close() }
+
+        let summary = try engine.harvestPendingRefetches()
+        XCTAssertEqual(summary.checked, 3)
+        XCTAssertEqual(summary.succeededHTTP, 1)
+        XCTAssertEqual(summary.succeededBrowser, 1)
+        XCTAssertEqual(summary.exhausted, 1)
+        XCTAssertEqual(summary.stillPending, 0)
+        XCTAssertEqual(engine.state.rssRefetch, summary)
+
+        // Stage A succeeded without invoking browser for rss_a1; browser was only called for rss_a2 and rss_a3
+        XCTAssertEqual(browser.extractedURLs, ["https://csr-blog.example.org/post/2", "https://gated.example.net/post/3"])
+
+        let posts = postedPayloads.value
+        XCTAssertEqual(posts.count, 3)
+
+        // 1. rss_a1: edge_http upgrade with refreshed pipeline_raw and force_clean=true
+        let post1Art = posts[0]["articles"]?.arrayValue?.first
+        XCTAssertEqual(posts[0]["source_name"]?.stringValue, "Simon Willison")
+        XCTAssertEqual(posts[0]["clean"]?.boolValue, true)
+        XCTAssertEqual(posts[0]["force_clean"]?.boolValue, true)
+        XCTAssertEqual(post1Art?["metadata"]?["refetch_status"]?.stringValue, "succeeded_edge")
+        XCTAssertEqual(post1Art?["metadata"]?["refetch_channel"]?.stringValue, "edge_http")
+        XCTAssertEqual(post1Art?["metadata"]?["has_full_content"]?.boolValue, true)
+        XCTAssertEqual(post1Art?["metadata"]?["pipeline_raw"]?["content"]?.stringValue, post1Art?["content"]?.stringValue)
+
+        // 2. rss_a2: edge_browser upgrade
+        let post2Art = posts[1]["articles"]?.arrayValue?.first
+        XCTAssertEqual(posts[1]["force_clean"]?.boolValue, true)
+        XCTAssertEqual(post2Art?["metadata"]?["refetch_channel"]?.stringValue, "edge_browser")
+        XCTAssertTrue((post2Art?["content"]?.stringValue ?? "").contains("Rendered via Ego Browser"))
+
+        // 3. rss_a3: 3rd failed attempt -> exhausted, summary preserved, clean=false
+        let post3Art = posts[2]["articles"]?.arrayValue?.first
+        XCTAssertEqual(posts[2]["clean"]?.boolValue, false)
+        XCTAssertEqual(posts[2]["force_clean"]?.boolValue, false)
+        XCTAssertEqual(post3Art?["content"]?.stringValue, "Summary kept safely.")
+        XCTAssertEqual(post3Art?["metadata"]?["refetch_attempts"]?.intValue, 3)
+        XCTAssertEqual(post3Art?["metadata"]?["refetch_status"]?.stringValue, "exhausted")
     }
 }

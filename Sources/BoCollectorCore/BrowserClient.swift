@@ -40,6 +40,28 @@ public struct BrowserDownloadItem: Codable, Sendable {
     }
 }
 
+public struct BrowserArticleExtractResult: Equatable, Sendable {
+    public var status: String // "ok" | "interstitial_blocked" | "unavailable" | "error"
+    public var title: String
+    public var markdown: String
+    public var finalURL: String
+    public var message: String
+
+    public init(
+        status: String,
+        title: String = "",
+        markdown: String = "",
+        finalURL: String = "",
+        message: String = ""
+    ) {
+        self.status = status
+        self.title = title
+        self.markdown = markdown
+        self.finalURL = finalURL
+        self.message = message
+    }
+}
+
 public protocol BrowserCollecting: Sendable {
     func isAvailable() -> Bool
     func checkVersion() -> (ok: Bool, detail: String)
@@ -69,6 +91,13 @@ public protocol BrowserCollecting: Sendable {
         spaceId: Int?,
         finishWhenDone: Bool
     ) -> [String: String]
+    func extractReadableArticle(url: String, handoff: Bool) -> BrowserArticleExtractResult
+}
+
+public extension BrowserCollecting {
+    func extractReadableArticle(url: String, handoff: Bool = false) -> BrowserArticleExtractResult {
+        BrowserArticleExtractResult(status: "unavailable", message: "Browser article extractor not implemented")
+    }
 }
 
 public final class EgoBrowserClient: BrowserCollecting, @unchecked Sendable {
@@ -1184,5 +1213,252 @@ public final class EgoBrowserClient: BrowserCollecting, @unchecked Sendable {
           );
         }
         """#
+    }
+
+    public func extractReadableArticle(url: String, handoff: Bool = false) -> BrowserArticleExtractResult {
+        let targetURL = url.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !targetURL.isEmpty, targetURL.hasPrefix("http://") || targetURL.hasPrefix("https://") else {
+            return BrowserArticleExtractResult(status: "error", message: "Invalid article URL")
+        }
+        guard isAvailable() else {
+            return BrowserArticleExtractResult(status: "unavailable", message: "ego-browser CLI not found")
+        }
+
+        let outDir = workDir.appendingPathComponent("refetch-\(UUID().uuidString.prefix(8))")
+        try? FileManager.default.createDirectory(at: outDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: outDir) }
+
+        let resultFile = outDir.appendingPathComponent("article.json")
+        let cfgObj: JSONValue = .object([
+            "spaceName": .string("\(spaceName)-refetch"),
+            "targetUrl": .string(targetURL),
+            "handoff": .bool(handoff),
+        ])
+        let script = Self.buildReadableArticleMJS(configJSON: cfgObj.toJSONString(), resultPath: resultFile.path)
+
+        do {
+            let proc = try runMJS(script, prefix: "rss-refetch", timeout: 45)
+            if FileManager.default.fileExists(atPath: resultFile.path),
+               let data = try? Data(contentsOf: resultFile),
+               let json = try? JSONValue.parse(data: data) {
+                return BrowserArticleExtractResult(
+                    status: json["status"]?.stringValue ?? "error",
+                    title: json["title"]?.stringValue ?? "",
+                    markdown: json["markdown"]?.stringValue ?? "",
+                    finalURL: json["finalUrl"]?.stringValue ?? targetURL,
+                    message: json["message"]?.stringValue ?? ""
+                )
+            }
+            let errText = (proc.stderr.isEmpty ? proc.stdout : proc.stderr).trimmingCharacters(in: .whitespacesAndNewlines)
+            return BrowserArticleExtractResult(status: "error", message: errText.isEmpty ? "ego-browser returned empty output" : errText)
+        } catch {
+            return BrowserArticleExtractResult(status: "error", message: error.localizedDescription)
+        }
+    }
+
+    private static func buildReadableArticleMJS(configJSON: String, resultPath: String) -> String {
+        let escapedResultPath = JSONValue.string(resultPath).toJSONString()
+        return """
+        const fs = await import("node:fs/promises");
+        const CFG = \(configJSON);
+        const RESULT_PATH = \(escapedResultPath);
+        const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
+        let task = null;
+        try {
+          task = await taskSpace(CFG.spaceName);
+          const page = await task.open(CFG.targetUrl);
+          await sleepMs(2200);
+
+          const extracted = await page.evaluate(() => {
+            const rawHtml = document.documentElement ? document.documentElement.innerHTML : "";
+            const bodyText = (document.body && document.body.innerText ? document.body.innerText : "").trim();
+            const lowerHtml = rawHtml.toLowerCase();
+            const lowerTxt = bodyText.toLowerCase();
+
+            const hasCaptchaWidget =
+              lowerHtml.includes("cf-turnstile") ||
+              lowerHtml.includes("g-recaptcha") ||
+              lowerHtml.includes("hcaptcha");
+            const isInterstitial =
+              (hasCaptchaWidget && bodyText.length < 800) ||
+              (bodyText.length < 1000 && (
+                (bodyText.includes("环境异常") && bodyText.includes("验证")) ||
+                lowerTxt.includes("just a moment...") ||
+                lowerTxt.includes("enable javascript and cookies to continue") ||
+                lowerTxt.includes("verify you are human")
+              ));
+
+            if (isInterstitial) {
+              return { blocked: true, title: document.title || "", markdown: "", finalUrl: location.href };
+            }
+
+            const selectors = [
+              "#js_content",
+              "article",
+              "[role='main']",
+              "main",
+              ".rich_media_content",
+              ".post-content",
+              ".entry-content",
+              ".article-content",
+              ".markdown-body",
+            ];
+            let root = null;
+            for (const sel of selectors) {
+              const el = document.querySelector(sel);
+              if (el && (el.innerText || "").trim().length >= 120) {
+                root = el;
+                break;
+              }
+            }
+            if (!root) root = document.body || document.documentElement;
+
+            const skipTags = new Set(["SCRIPT", "STYLE", "NOSCRIPT", "SVG", "NAV", "HEADER", "FOOTER", "ASIDE", "FORM", "IFRAME"]);
+            const toAbs = (raw) => {
+              if (!raw) return "";
+              try { return new URL(raw, location.href).href; } catch (_e) { return raw; }
+            };
+
+            const walkInline = (node) => {
+              if (!node) return "";
+              if (node.nodeType === Node.TEXT_NODE) {
+                return (node.nodeValue || "").replace(/\\s+/g, " ");
+              }
+              if (node.nodeType !== Node.ELEMENT_NODE) return "";
+              const tag = node.tagName.toUpperCase();
+              if (skipTags.has(tag)) return "";
+              if (tag === "BR") return "\\n";
+              if (tag === "IMG") {
+                const src = toAbs(node.getAttribute("data-src") || node.getAttribute("data-original") || node.getAttribute("src") || "");
+                if (!src || src.startsWith("data:")) return "";
+                const alt = (node.getAttribute("alt") || "").trim();
+                return `![${alt}](${src})`;
+              }
+              const inner = [...node.childNodes].map(walkInline).join("");
+              if (tag === "CODE") return inner.trim() ? `\\`${inner.trim()}\\`` : "";
+              if (tag === "STRONG" || tag === "B") return inner.trim() ? `**${inner.trim()}**` : "";
+              if (tag === "EM" || tag === "I") return inner.trim() ? `*${inner.trim()}*` : "";
+              if (tag === "A") {
+                const href = toAbs(node.getAttribute("href") || "");
+                const label = inner.trim() || href;
+                return href && !href.startsWith("javascript:") ? `[${label}](${href})` : label;
+              }
+              return inner;
+            };
+
+            const blocks = [];
+            const walkBlock = (node) => {
+              if (!node) return;
+              if (node.nodeType === Node.TEXT_NODE) {
+                const t = (node.nodeValue || "").trim();
+                if (t) blocks.push(t);
+                return;
+              }
+              if (node.nodeType !== Node.ELEMENT_NODE) return;
+              const tag = node.tagName.toUpperCase();
+              if (skipTags.has(tag)) return;
+
+              if (/^H[1-6]$/.test(tag)) {
+                const lvl = Number(tag.slice(1));
+                const txt = walkInline(node).trim();
+                if (txt) blocks.push(`${"#".repeat(lvl)} ${txt}`);
+                return;
+              }
+              if (tag === "PRE") {
+                const codeText = (node.innerText || "").replace(/\\n+$/, "");
+                if (codeText.trim()) blocks.push("```\\n" + codeText + "\\n```");
+                return;
+              }
+              if (tag === "BLOCKQUOTE") {
+                const q = (node.innerText || "").trim();
+                if (q) blocks.push(q.split("\\n").map((l) => `> ${l}`).join("\\n"));
+                return;
+              }
+              if (tag === "UL" || tag === "OL") {
+                const items = [...node.children].filter((c) => c.tagName && c.tagName.toUpperCase() === "LI");
+                const lines = items.map((li, i) => {
+                  const txt = walkInline(li).trim();
+                  return txt ? `${tag === "OL" ? `${i + 1}.` : "-"} ${txt}` : "";
+                }).filter(Boolean);
+                if (lines.length) blocks.push(lines.join("\\n"));
+                return;
+              }
+              if (tag === "IMG") {
+                const mdImg = walkInline(node).trim();
+                if (mdImg) blocks.push(mdImg);
+                return;
+              }
+              if (tag === "P") {
+                const txt = walkInline(node).trim();
+                if (txt) blocks.push(txt);
+                return;
+              }
+              const hasBlockChild = [...node.children].some((c) =>
+                c.tagName && ["DIV", "SECTION", "ARTICLE", "MAIN", "P", "PRE", "UL", "OL", "BLOCKQUOTE", "H1", "H2", "H3", "H4", "H5", "H6", "FIGURE"].includes(c.tagName.toUpperCase())
+              );
+              if (hasBlockChild) {
+                for (const child of node.childNodes) walkBlock(child);
+              } else {
+                const txt = walkInline(node).trim();
+                if (txt) blocks.push(txt);
+              }
+            };
+
+            walkBlock(root);
+            const titleEl = document.querySelector("#activity-name, h1");
+            const pageTitle = (titleEl && titleEl.innerText ? titleEl.innerText : document.title || "").trim();
+            return {
+              blocked: false,
+              title: pageTitle,
+              markdown: blocks.join("\\n\\n").replace(/\\n{3,}/g, "\\n\\n").trim(),
+              finalUrl: location.href,
+            };
+          });
+
+          await task.finish({ keep: [] }).catch(() => null);
+          task = null;
+
+          if (extracted && extracted.blocked) {
+            await fs.writeFile(
+              RESULT_PATH,
+              JSON.stringify({
+                status: "interstitial_blocked",
+                title: extracted.title || "",
+                markdown: "",
+                finalUrl: extracted.finalUrl || CFG.targetUrl,
+                message: "Origin page gated by verification interstitial",
+              }),
+              "utf8"
+            );
+          } else {
+            await fs.writeFile(
+              RESULT_PATH,
+              JSON.stringify({
+                status: "ok",
+                title: (extracted && extracted.title) || "",
+                markdown: (extracted && extracted.markdown) || "",
+                finalUrl: (extracted && extracted.finalUrl) || CFG.targetUrl,
+                message: "ok",
+              }),
+              "utf8"
+            );
+          }
+        } catch (err) {
+          if (task) {
+            await task.finish({ keep: [] }).catch(() => null);
+          }
+          await fs.writeFile(
+            RESULT_PATH,
+            JSON.stringify({
+              status: "error",
+              title: "",
+              markdown: "",
+              finalUrl: CFG.targetUrl,
+              message: err && err.message ? err.message : String(err),
+            }),
+            "utf8"
+          );
+        }
+        """
     }
 }

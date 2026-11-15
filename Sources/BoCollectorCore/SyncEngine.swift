@@ -5,6 +5,7 @@ import Foundation
 public struct RemoteStatePayload: Sendable {
     public var recentIds: [String]
     public var pendingAsrArticles: [ArticlePayload]
+    public var pendingRefetchArticles: [ArticlePayload]
     public var monitoredUsers: [XMonitorUser]
     public var xMonitorConfig: XMonitorRemoteConfig?
     public var totalArticles: Int
@@ -13,6 +14,7 @@ public struct RemoteStatePayload: Sendable {
     public init(
         recentIds: [String] = [],
         pendingAsrArticles: [ArticlePayload] = [],
+        pendingRefetchArticles: [ArticlePayload] = [],
         monitoredUsers: [XMonitorUser] = [],
         xMonitorConfig: XMonitorRemoteConfig? = nil,
         totalArticles: Int = 0,
@@ -20,6 +22,7 @@ public struct RemoteStatePayload: Sendable {
     ) {
         self.recentIds = recentIds
         self.pendingAsrArticles = pendingAsrArticles
+        self.pendingRefetchArticles = pendingRefetchArticles
         self.monitoredUsers = monitoredUsers
         self.xMonitorConfig = xMonitorConfig
         self.totalArticles = totalArticles
@@ -122,7 +125,7 @@ public final class SyncEngine: @unchecked Sendable {
         guard !config.remotePushURL.isEmpty, !config.remoteIngestToken.isEmpty else {
             throw NSError(domain: "BoCollector", code: 401, userInfo: [NSLocalizedDescriptionKey: "请先在配置面板填写云端接收地址与 Ingest Token"])
         }
-        let name = sourceName?.nonEmpty ?? SourceNames.displayName(for: platform)
+        let name = platform == "rss" ? (sourceName ?? "") : (sourceName?.nonEmpty ?? SourceNames.displayName(for: platform))
         let url = try URLSessionHTTPTransport.makeURL(
             "\(config.remotePushURL)/api/ingest/state",
             query: ["source_type": platform, "source_name": name]
@@ -148,6 +151,16 @@ public final class SyncEngine: @unchecked Sendable {
             }
         }
 
+        var pendingRefetch: [ArticlePayload] = []
+        if let rawRefetch = body["pending_refetch_articles"]?.arrayValue {
+            for item in rawRefetch {
+                if let data = try? item.toData(),
+                   let art = try? JSONDecoder().decode(ArticlePayload.self, from: data) {
+                    pendingRefetch.append(art)
+                }
+            }
+        }
+
         var monUsers: [XMonitorUser] = []
         if let rawUsers = body["monitored_users"]?.arrayValue {
             for item in rawUsers {
@@ -168,6 +181,7 @@ public final class SyncEngine: @unchecked Sendable {
         return RemoteStatePayload(
             recentIds: recentIds,
             pendingAsrArticles: pendingAsr,
+            pendingRefetchArticles: pendingRefetch,
             monitoredUsers: monUsers,
             xMonitorConfig: monCfg,
             totalArticles: body["total_articles"]?.intValue ?? 0,
@@ -230,6 +244,7 @@ public final class SyncEngine: @unchecked Sendable {
             platform: platform,
             articles: [article],
             recentIds: rIds,
+            sourceName: platform == "rss" ? article.source.name : nil,
             clean: clean,
             forceClean: forceClean
         )
@@ -360,6 +375,55 @@ public final class SyncEngine: @unchecked Sendable {
         return try resp.json()
     }
 
+    public func harvestPendingRefetches(limitOverride: Int? = nil) throws -> RssRefetchSummary {
+        guard config.rssRefetchEnabled,
+              !config.remotePushURL.isEmpty,
+              !config.remoteIngestToken.isEmpty else {
+            return RssRefetchSummary()
+        }
+        let remoteBody = try fetchRemoteState(platform: "rss", sourceName: "")
+        let pendingArticles = remoteBody.pendingRefetchArticles
+        if pendingArticles.isEmpty {
+            let empty = RssRefetchSummary()
+            state.rssRefetch = empty
+            try saveState()
+            return empty
+        }
+
+        let refetchEngine = ArticleRefetchEngine(config: config, http: http, browser: browser, logger: logger)
+        let summary = try refetchEngine.refetchPending(articles: pendingArticles, limitOverride: limitOverride) { [weak self] upgradedArt, shouldClean in
+            guard let self else { return [:] }
+            return try self.pushSingleArticle(
+                platform: "rss",
+                article: upgradedArt,
+                recentIds: [upgradedArt.id],
+                clean: shouldClean,
+                forceClean: shouldClean
+            )
+        }
+
+        state.rssRefetch = summary
+        try saveState()
+        if summary.totalSucceeded > 0 || summary.exhausted > 0 {
+            logger.info(
+                "[RSS 边缘补抓] 检查 \(summary.checked) 篇 -> HTTP 补齐 \(summary.succeededHTTP) 篇 / ego-lite 补齐 \(summary.succeededBrowser) 篇"
+                + (summary.stillPending > 0 ? " / 仍待补抓 \(summary.stillPending) 篇" : "")
+                + (summary.exhausted > 0 ? " / 达上限放弃 \(summary.exhausted) 篇" : "")
+            )
+        }
+        return summary
+    }
+
+    private static func rssSummaryJSON(_ summary: RssRefetchSummary) -> JSONValue {
+        .object([
+            "checked": .int(summary.checked),
+            "succeeded_http": .int(summary.succeededHTTP),
+            "succeeded_browser": .int(summary.succeededBrowser),
+            "still_pending": .int(summary.stillPending),
+            "exhausted": .int(summary.exhausted),
+        ])
+    }
+
     // MARK: - Incremental Sync
 
     public func syncOnce(
@@ -368,7 +432,7 @@ public final class SyncEngine: @unchecked Sendable {
         ignoreAuthPause: Bool = false
     ) -> [String: JSONValue] {
         let targets = platforms ?? config.enabledDefaultPlatforms
-        if state.healer?.authPaused == true && !ignoreAuthPause {
+        if state.healer?.authPaused == true && !ignoreAuthPause && targets != ["rss"] {
             let pausedPlat = state.healer?.authPlatform ?? "unknown"
             logger.warn("当前处于人工验证暂停态 (\(pausedPlat))，请验证后执行恢复采集")
             return ["status": .string("auth_paused"), "platform": .string(pausedPlat)]
@@ -394,12 +458,31 @@ public final class SyncEngine: @unchecked Sendable {
 
                 var results: [String: JSONValue] = [:]
                 var firstTransientError: String? = nil
+                var rssRes = state.rssRefetch ?? RssRefetchSummary()
+
+                if platforms == nil && config.rssRefetchEnabled {
+                    stage = "harvest_rss_refetch"
+                    do {
+                        rssRes = try harvestPendingRefetches(limitOverride: limitOverride)
+                    } catch {
+                        let (label, transient) = ErrorSanitizer.summarize(error)
+                        if transient {
+                            logger.warn("[RSS 边缘补抓] 瞬时网络/队列波动 (\(label))，已延后重试")
+                            if firstTransientError == nil { firstTransientError = label }
+                        } else {
+                            throw error
+                        }
+                    }
+                }
 
                 for plat in targets {
                     stage = "sync:\(plat)"
                     do {
                         if plat == "x_monitor" {
                             results[plat] = try syncXMonitorIncremental(limitOverride: limitOverride)
+                        } else if plat == "rss" {
+                            rssRes = try harvestPendingRefetches(limitOverride: limitOverride)
+                            results[plat] = Self.rssSummaryJSON(rssRes)
                         } else {
                             results[plat] = try syncFeedIncremental(platform: plat, limitOverride: limitOverride)
                         }
@@ -429,6 +512,7 @@ public final class SyncEngine: @unchecked Sendable {
                             "completed": .int(asrRes.completed),
                             "still_pending": .int(asrRes.stillPending),
                         ]),
+                        "rss_refetch": Self.rssSummaryJSON(rssRes),
                         "sources": .object(results),
                     ]
                 }
@@ -443,6 +527,7 @@ public final class SyncEngine: @unchecked Sendable {
                         "completed": .int(asrRes.completed),
                         "still_pending": .int(asrRes.stillPending),
                     ]),
+                    "rss_refetch": Self.rssSummaryJSON(rssRes),
                     "sources": .object(results),
                 ]
             } catch let authErr as AuthRequiredError {

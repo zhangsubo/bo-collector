@@ -199,8 +199,8 @@ public final class AppModel {
         guard !isBusy else { return }
         if hasUnsavedChanges { saveConfiguration() }
         let snapCfg = savedConfig
-        let platforms: [String] = source == "all"
-            ? (snapCfg.enabledDefaultPlatforms.isEmpty ? ["x_bookmarks", "douyin"] : snapCfg.enabledDefaultPlatforms)
+        let platforms: [String]? = source == "all"
+            ? ((!snapCfg.enabledDefaultPlatforms.isEmpty || snapCfg.rssRefetchEnabled) ? nil : ["x_bookmarks", "douyin"])
             : [source]
 
         isBusy = true
@@ -285,6 +285,39 @@ public final class AppModel {
         }
     }
 
+    public func refetchRssNow() {
+        guard !isBusy else { return }
+        if hasUnsavedChanges { saveConfiguration() }
+        let snapCfg = savedConfig
+        isBusy = true
+        busyLabel = "正在边缘补抓云端 RSS 待处理全文…"
+
+        Task {
+            let outcome = await Task.detached(priority: .userInitiated) { () -> Result<String, Error> in
+                let logger = SafeLogger(logPath: snapCfg.stateDir.appendingPathComponent("logs/collector.log"), echo: false)
+                let engine = SyncEngine(config: snapCfg, logger: logger)
+                defer { engine.close() }
+                do {
+                    let res = try engine.harvestPendingRefetches()
+                    return .success(
+                        "RSS 边缘补抓：检查 \(res.checked) 篇 · 补齐 \(res.totalSucceeded) 篇 (HTTP \(res.succeededHTTP) / 浏览器 \(res.succeededBrowser)) · 仍待补抓 \(res.stillPending) 篇"
+                        + (res.exhausted > 0 ? " · 达上限放弃 \(res.exhausted) 篇" : "")
+                    )
+                } catch {
+                    return .failure(error)
+                }
+            }.value
+
+            isBusy = false
+            busyLabel = ""
+            reloadDiskSnapshots()
+            switch outcome {
+            case .success(let msg): showBanner(msg, isError: false)
+            case .failure(let err): showBanner("RSS 边缘补抓失败: \(ErrorSanitizer.sanitizeDetail(err.localizedDescription))", isError: true)
+            }
+        }
+    }
+
     public func startBackfill(source: String = "all", maxItems: Int = 500) {
         guard !isBusy else { return }
         if hasUnsavedChanges { saveConfiguration() }
@@ -355,7 +388,8 @@ public final class AppModel {
                     let xState = try engine.fetchRemoteState(platform: "x_bookmarks")
                     let dyState = try engine.fetchRemoteState(platform: "douyin")
                     let xmState = try? engine.fetchRemoteState(platform: "x_monitor")
-                    let detail = "✓ 连通成功 · 云端近期水位 X=\(xState.recentIds.count) / 抖音=\(dyState.recentIds.count) / 待转写=\(dyState.pendingAsrArticles.count)"
+                    let rssState = try? engine.fetchRemoteState(platform: "rss", sourceName: "")
+                    let detail = "✓ 连通成功 · 云端近期水位 X=\(xState.recentIds.count) / 抖音=\(dyState.recentIds.count) / 待转写=\(dyState.pendingAsrArticles.count) / 待补抓RSS=\(rssState?.pendingRefetchArticles.count ?? 0)"
                     return (true, detail, xmState?.monitoredUsers ?? [])
                 } catch {
                     return (false, "✗ \(ErrorSanitizer.summarize(error).label)", [])
